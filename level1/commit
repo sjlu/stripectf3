@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Move into directory
+cd level1/
+
+# Brute force until you find something that's lexicographically
+# small than $difficulty.
+# difficulty=$(cat difficulty.txt)
+
+# Create a Git tree object reflecting our current working
+# directory
+# tree=$(git write-tree)
+# parent=$(git rev-parse HEAD)
+# timestamp=$(date +%s)
+
+export counter=$1
+export tree=$2
+export parent=$3
+export timestamp=$4
+
+body="tree $tree
+parent $parent
+author CTF user <me@example.com> $timestamp +0000
+committer CTF user <me@example.com> $timestamp +0000
+
+Give me a Gitcoin
+
+$counter"
+
+# Testing
+sha1=$(git hash-object -t commit --stdin <<< "$body")
+
+# Writing
+git hash-object -t commit --stdin -w <<< "$body"  > /dev/null
+git reset --hard "$sha1"
+git push origin master
+
+exit 0

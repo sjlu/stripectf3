@@ -1,0 +1,25 @@
+#!/bin/bash
+set -eu
+
+# Command line arguments
+export clone_spec='lvl1-utccvbby@stripe-ctf.com:current-round'
+export public_username="user-y8oyflcg"
+
+# Varibales
+local_path=./level1
+
+# Clone or reset
+if [ -d "$local_path" ]; then
+    cd "$local_path"
+    git fetch origin master
+    git reset --hard origin/master
+else
+    git clone "$clone_spec" "$local_path"
+    cd "$local_path"
+fi
+
+# Write new ledger
+perl -i -pe 's/($ENV{public_username}: )(\d+)/$1 . ($2+1)/e' LEDGER.txt
+grep -q "$public_username" LEDGER.txt || echo "$public_username: 1" >> LEDGER.txt
+
+git add LEDGER.txt

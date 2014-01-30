@@ -1,0 +1,254 @@
+#!/usr/bin/env node
+
+"use strict";
+
+var http = require('http');
+var httpProxy = require('./network_simulation/lib/proxy');
+var checkServer = require('./network_simulation/lib/check_server');
+var nopt = require('nopt');
+var url = require('url');
+
+var RequestData = function (request, response, buffer) {
+  this.request = request;
+  this.response = response;
+  this.buffer = buffer;
+};
+
+function ipFromRequest(reqData) {
+  return reqData.request.headers['x-forwarded-for'];
+}
+
+var rejectedRequests = [];
+
+function queueRejectedRequest(reqData) {
+  if (rejectedRequests.length < 10) {
+    rejectedRequests.append(reqData);
+    return;
+  }
+  rejectRequest(reqData);
+}
+
+function rejectRequest(reqData) {
+  reqData.response.writeHead(400);
+  reqData.response.end();
+}
+
+function allowRequest(proxy, reqData) {
+  proxy.proxyRequest(reqData.request, reqData.response, reqData.buffer);
+}
+
+var proxyCapacity = {};
+var proxiesBeingUsed = {};
+var usableProxies = [];
+
+function selectProxy () {
+  for (var i = 0; i < usableProxies.length; i++) {
+    // console.log(proxyCapacity);
+    if (!proxyCapacity[i] || proxyCapacity[i] < 2) {
+      if (!proxyCapacity[i]) {
+        proxyCapacity[i] = 0;
+      }
+      proxyCapacity[i]++;
+      // console.log('gave ' + i);
+      // console.log(proxyCapacity);
+      return usableProxies[i];
+    }
+  }
+  // console.log('gave null');
+};
+
+function freeProxy (proxy) {
+  for (var i in usableProxies) {
+    if (usableProxies[i] == proxy) {
+      proxyCapacity[i]--;
+      // console.log('freed ' + i);
+    }
+  }
+};
+
+function hasFreeProxy() {
+  var sum = 0;
+  for (var i in proxyCapacity) {
+    sum += proxyCapacity[i];
+  }
+  // console.log(sum);
+  if (sum >= usableProxies.length * 2) {
+    return false;
+  }
+  return true;
+}
+
+var requestsPerIP = {};
+var numberOfRequests = 0;
+
+function logRequest(ip) {
+  if (!requestsPerIP[ip]) {
+    requestsPerIP[ip] = 0
+  }
+  requestsPerIP[ip] += 1;
+  numberOfRequests++;
+}
+
+function hasTooManyRequests(ip) {
+  var average = numberOfRequests / Object.keys(requestsPerIP).length;
+  // console.log(average);
+  // console.log(requestsPerIP);
+  if (requestsPerIP[ip] > average) {
+    return true;
+  }
+
+  return false;
+}
+
+function rateLimited(ip) {
+  if (requestsPerIP[ip] >= 5) {
+    return true;
+  }
+
+  return false;
+}
+
+var requestQueue = [];
+var currentIpsInQueue = {};
+function addToQueue(reqData) {
+  var ip = ipFromRequest(reqData);
+  if (!currentIpsInQueue[ip]) {
+    currentIpsInQueue[ip] = 0;
+  }
+  currentIpsInQueue[ip]++;
+  requestQueue.push(reqData)
+}
+
+function popFromQueue() {
+  var reqData = requestQueue.pop();
+  currentIpsInQueue[ipFromRequest(reqData)]--;
+  return reqData;
+}
+
+var blacklist = {};
+function hasRequestPending(ip) {
+  // console.log(currentIpsInQueue);
+  if (currentIpsInQueue[ip]) {
+    blacklist[ip] = true;
+    return true;
+  }
+  return false;
+}
+
+function currentlyBlacklisted(ip) {
+  if (blacklist[ip]) {
+    return true;
+  }
+
+  return false;
+}
+
+var Queue = function (proxies, parameters) {
+  usableProxies = proxies;
+
+  this.proxies = proxies;
+  this.parameters = parameters;
+};
+Queue.prototype.takeRequest = function (reqData) {
+  // Reject traffic as necessary:
+  var ip = ipFromRequest(reqData);
+
+  logRequest(ip);
+  // console.log(requestsPerIP);
+  if (hasRequestPending(ip) || rateLimited(ip)) {
+    // if (hasFreeProxy()) {
+      rejectRequest(reqData);
+      // console.log('rejected');
+      return;
+    // }
+  }
+  // console.log('allowed');
+  // Otherwise proxy it through:
+  // console.log(ipFromRequest(reqData));
+  addToQueue(reqData);
+
+  if (hasFreeProxy()) {
+    allowRequest(selectProxy(), popFromQueue());
+  }
+
+  // selectProxy(this.proxies).proxyRequest(reqData.request, reqData.response, reqData.buffer);
+};
+Queue.prototype.requestFinished = function (reqData) {
+  freeProxy(this);
+
+  if (requestQueue.length) {
+    allowRequest(selectProxy(), popFromQueue());
+  }
+
+  return;
+};
+
+function checkBackends(targets, path, response) {
+  var toCheck = targets.map(function (target) {
+    var output = {};
+    output['host'] = target['host'];
+    output['port'] = target['port'];
+    output['path'] = path;
+    return output;
+  });
+  var success = function () {
+    response.writeHead(200, {"Content-Type": "application/json"});
+    response.end()
+  };
+  var error = function () {
+    response.writeHead(500, {"Content-Type": "application/json"});
+    response.end()
+  };
+  checkServer.checkServers(toCheck, success, error);
+}
+
+function main() {
+  var opts = {
+    "out-ports": String,
+    "in-port": String,
+  };
+  var parsed = nopt(opts),
+      inPort = parsed['in-port'] || '3000',
+      outPorts = parsed['out-ports'] ? parsed['out-ports'].split(",") : ['3001'],
+      targets = [],
+      target,
+      proxies = [],
+      proxy,
+      i;
+
+  for (i = 0; i < outPorts.length; i++) {
+    target = {'host': 'localhost', 'port': outPorts[i]};
+    targets.push(target);
+    proxy = new httpProxy.HttpProxy({'target': target});
+    proxy.identifier = i;
+    proxies.push(proxy);
+  }
+
+  var queue = new Queue(proxies, {});
+  for (i = 0; i < proxies.length; i++) {
+    proxy = proxies[i];
+    proxy.on("end", queue.requestFinished);
+  }
+
+  var server = http.createServer(function (req, res) {
+    if (req.method === "HEAD") {
+      // HEAD requests are used to monitor the status of the simulation
+      // proxies[0].proxyRequest(reqData.request, reqData.response, reqData.buffer);
+      checkBackends(targets, url.parse(req.url)['pathname'], res);
+    } else {
+      var buffer = httpProxy.buffer(req);
+      var reqData = new RequestData(req, res, buffer);
+      queue.takeRequest(reqData);
+    }
+  });
+
+  server.on('close', function () {
+    for (i = 0; i < proxies.length; i++) {
+      proxies[i].close();
+    }
+  });
+  console.log("The shield is up and listening.");
+  server.listen(inPort);
+}
+
+main();
